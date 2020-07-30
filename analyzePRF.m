@@ -37,6 +37,11 @@ function results = analyzePRF(stimulus,data,tr,options)
 %     best seed based on the super-grid to be returned as the final estimate, thereby
 %     bypassing the computationally expensive optimization procedure.  further notes
 %     on this case are given below.
+%   <modelmode> (optional) is
+%     1 means a two-stage approach (optimize all parameters excluding exponent,
+%       and then optimize all parameters)
+%     2 means a one-stage approach (optimize all parameters)
+%     default: 1.
 %   <xvalmode> (optional) is
 %     0 means just fit all the data
 %     1 means two-fold cross-validation (first half of runs; second half of runs)
@@ -70,8 +75,8 @@ function results = analyzePRF(stimulus,data,tr,options)
 %   Values are in percentages and generally range between 0% and 100%.  The R^2 values
 %   are computed after projecting out polynomials from both the data and the model fit.
 %   (Because of this projection, R^2 values can sometimes drop below 0%.)  Note that
-%   if cross-validation is used (see <xvalmode>), the interpretation of <R2> changes
-%   accordingly.
+%   if cross-validation is used (see <xvalmode>), the <R2> is still the _training_ 
+%   performance for each iteration.
 % <resnorms> and <numiters> contain optimization details (residual norms and 
 %   number of iterations, respectively).
 % <meanvol> contains the mean volume, that is, the mean of each voxel's time-series.
@@ -80,6 +85,11 @@ function results = analyzePRF(stimulus,data,tr,options)
 %   in the code.  These raw parameters are transformed to a more palatable format for
 %   the user (as described above).
 % <options> contains a record of the options used in the call to analyzePRF.m.
+%
+% If cross-validation (<xvalmode> ~= 0) is used, the results structure also contains:
+% <testperformance> contains R^2 values for the testing performance on each iteration.
+% <aggregatedtestperformance> contains R^2 values for testing performance after
+%   aggregating predictions across iterations.
 %
 % Details on the pRF model:
 % - Before analysis, we zero out any voxel that has a non-finite value or has all zeros
@@ -134,9 +144,9 @@ function results = analyzePRF(stimulus,data,tr,options)
 % - When <seedmode> is -2, optimization is not performed and instead the best seed
 %   based on the super-grid is returned as the final estimate.  If this case is used,
 %   we automatically enforce that:
-%   - opt.xvalmode is 0
-%   - opt.vxs is []
-%   - opt.numperjob is []
+%   - options.xvalmode is 0
+%   - options.vxs is []
+%   - options.numperjob is []
 %   Also, in terms of outputs:
 %   - The <gain> output is not estimated, and gain values are just returned as <typicalgain>.
 %   - The <R2> output will contain correlation values (r) that range between -1 and 1.
@@ -146,6 +156,18 @@ function results = analyzePRF(stimulus,data,tr,options)
 %   - The <resnorms> and <numiters> outputs will be empty.
 %
 % history:
+% 2020/06/18 - add <modelmode> input option.  Fix opt -> options typo bug.
+% 2020/03/05 - BUG FIX. Previously, when <xvalmode> ~= 0, the <R2> values that were output
+%              were training performance values (even though we implied that they were
+%              testing performance values). Now, we preserve that behavior, but now also
+%              output new fields <testperformance> and <aggregatedtestperformance>,
+%              which indicate the cross-validated values.
+% 2019/08/23 - Major change: the <stimulus> variable is now no longer forced to become
+%              single format. This means the user controls whether computations are done
+%              in double or single format. Please note that behavior (including finicky
+%              local minima issues) can be highly dependent on the format. Parameter estimates
+%              may be substantially more accurate (and may take substantially more computational
+%              time / iterations to converge) if computations are performed in double format.
 % 2015/02/07 - version 1.2
 % 2015/02/07 - make analyzePRFcomputesupergridseeds.m less memory intensive
 % 2014/11/10 - implement <wantglmdenoise> for the <seedmode> -2 case.
@@ -223,6 +245,9 @@ end
 if ~isfield(options,'seedmode') || isempty(options.seedmode)
   options.seedmode = [0 1 2];
 end
+if ~isfield(options,'modelmode') || isempty(options.modelmode)
+  options.modelmode = 1;
+end
 if ~isfield(options,'xvalmode') || isempty(options.xvalmode)
   options.xvalmode = 0;
 end
@@ -245,9 +270,9 @@ options.seedmode = union(options.seedmode(:),[]);
 
 % massage more
 if wantquick
-  opt.xvalmode = 0;
-  opt.vxs = 1:numvxs;
-  opt.numperjob = [];
+  options.xvalmode = 0;
+  options.vxs = 1:numvxs;
+  options.numperjob = [];
 end
 
 % calc
@@ -257,7 +282,8 @@ usecluster = ~isempty(options.numperjob);
 for p=1:length(stimulus)
   stimulus{p} = squish(stimulus{p},2)';  % frames x pixels
   stimulus{p} = [stimulus{p} p*ones(size(stimulus{p},1),1)];  % add a dummy column to indicate run breaks
-  stimulus{p} = single(stimulus{p});  % make single to save memory
+%% REMOVED ON AUG 23 2019!  THIS CHANGES PAST BEHAVIOR.
+%%  stimulus{p} = single(stimulus{p});  % make single to save memory
 end
 
 % deal with data badness (set bad voxels to be always all 0)
@@ -308,10 +334,16 @@ end
 
 % define the model (parameters are R C S G N)
 modelfun = @(pp,dd) conv2run(posrect(pp(4)) * (dd*[vflatten(placematrix(zeros(res),makegaussian2d(resmx,pp(1),pp(2),abs(pp(3)),abs(pp(3)),xx,yy,0,0) / (2*pi*abs(pp(3))^2))); 0]) .^ posrect(pp(5)),options.hrf,dd(:,prod(res)+1));
-model = {{[] [1-res(1)+1 1-res(2)+1 0    0   NaN;
-              2*res(1)-1 2*res(2)-1 Inf  Inf Inf] modelfun} ...
-         {@(ss)ss [1-res(1)+1 1-res(2)+1 0    0   0;
-                   2*res(1)-1 2*res(2)-1 Inf  Inf Inf] @(ss)modelfun}};
+switch options.modelmode
+case 1
+  model = {{[] [1-res(1)+1 1-res(2)+1 0    0   NaN;
+                2*res(1)-1 2*res(2)-1 Inf  Inf Inf] modelfun} ...
+           {@(ss)ss [1-res(1)+1 1-res(2)+1 0    0   0;
+                     2*res(1)-1 2*res(2)-1 Inf  Inf Inf] @(ss)modelfun}};
+case 2
+  model = {{[] [1-res(1)+1 1-res(2)+1 0    0   0;
+                2*res(1)-1 2*res(2)-1 Inf  Inf Inf] modelfun}};
+end
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% PREPARE SEEDS
 
@@ -519,7 +551,7 @@ else
 
     % submit jobs
     jobnames = {};
-    jobnames = [jobnames {makedirid(opt.outputdir,1)}];
+    jobnames = [jobnames {makedirid(options.outputdir,1)}];
     jobids = [];
     jobids = [jobids chpcrun(jobnames{end},'fitnonlinearmodel',options.numperjob, ...
                              1,ceil(length(options.vxs)/options.numperjob),[], ...
@@ -579,6 +611,10 @@ results.R2 =       NaN*zeros(numvxs,numfits);
 results.gain =     NaN*zeros(numvxs,numfits);
 results.resnorms = cell(numvxs,1);
 results.numiters = cell(numvxs,1);
+if options.xvalmode ~= 0
+  results.testperformance =           NaN*zeros(numvxs,numfits);
+  results.aggregatedtestperformance = NaN*zeros(numvxs,1);
+end
 
 % massage model parameters for output and put in 'results' struct
 results.ang(options.vxs,:) =    permute(mod(atan2((1+res(1))/2 - paramsA(:,1,:), ...
@@ -593,6 +629,10 @@ if ~wantquick
   results.resnorms(options.vxs) = a1.resnorms;
   results.numiters(options.vxs) = a1.numiters;
 end
+if options.xvalmode ~= 0
+  results.testperformance(options.vxs,:) =         permute(a1.testperformance,[2 1]);
+  results.aggregatedtestperformance(options.vxs) = a1.aggregatedtestperformance;
+end
 
 % reshape
 results.ang =      reshape(results.ang,      [xyzsize numfits]);
@@ -603,6 +643,10 @@ results.R2 =       reshape(results.R2,       [xyzsize numfits]);
 results.gain =     reshape(results.gain,     [xyzsize numfits]);
 results.resnorms = reshape(results.resnorms, [xyzsize 1]);
 results.numiters = reshape(results.numiters, [xyzsize 1]);
+if options.xvalmode ~= 0
+  results.testperformance =           reshape(results.testperformance,[xyzsize numfits]);
+  results.aggregatedtestperformance = reshape(results.aggregatedtestperformance,[xyzsize 1]);
+end
 
 % add some more stuff
 results.meanvol =  meanvol;
